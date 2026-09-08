@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the UEBA engine watchdog every 2 minutes
+
+[Timer]
+# First run shortly after boot, then every 2 minutes thereafter.
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=ueba-engine-watchdog.service
+
+[Install]
+WantedBy=timers.target

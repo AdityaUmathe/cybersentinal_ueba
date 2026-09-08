@@ -1,0 +1,19 @@
+[Unit]
+Description=CyberSentinel UEBA Dashboard Server
+After=network-online.target ueba-engine.service
+Wants=network-online.target
+RequiresMountsFor=/root/NEW_DRIVE/aditya_ueba /data/aditya_ueba
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/NEW_DRIVE/aditya_ueba
+ExecStart=/root/NEW_DRIVE/aditya_ueba/venv/bin/python3 ueba_dashboard_server.py --config ueba_config.yaml
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+StandardOutput=append:/root/NEW_DRIVE/aditya_ueba/logs/ueba_dashboard.stdout.log
+StandardError=append:/root/NEW_DRIVE/aditya_ueba/logs/ueba_dashboard.stdout.log
+
+[Install]
+WantedBy=multi-user.target

@@ -16,6 +16,25 @@ from pathlib import Path
 log = logging.getLogger("ueba.if")
 
 
+def _zero_variance_cols(scaler, tag: str) -> np.ndarray:
+    """Indices of features that were CONSTANT (zero-variance) in training.
+
+    See ueba_models/autoencoder.py for the full rationale: StandardScaler leaves
+    such columns unscaled (scale_=1.0), so a value the live feed starts
+    populating after training passes through unnormalised. These columns carry
+    no learned signal, so we zero them post-scale. Remove once retrained on
+    representative data.
+    """
+    var = getattr(scaler, "var_", None)
+    if var is None:
+        return np.array([], dtype=int)
+    cols = np.where(var == 0)[0]
+    if len(cols):
+        log.warning("%s skew-guard: masking %d zero-variance feature(s) the "
+                    "model never learned (indices %s)", tag, len(cols), list(cols))
+    return cols
+
+
 class IsolationForestScorer:
     """
     Wraps the trained Isolation Forest for real-time inference.
@@ -45,6 +64,7 @@ class IsolationForestScorer:
 
         self.model  = joblib.load(model_path)
         self.scaler = joblib.load(scaler_path)
+        self._dead_cols = _zero_variance_cols(self.scaler, "IF")
         log.info("Isolation Forest loaded from %s", model_path)
 
     def score(self, feature_vec: np.ndarray) -> dict:
@@ -65,6 +85,8 @@ class IsolationForestScorer:
         vec_scaled = self.scaler.transform(
             feature_vec.reshape(1, -1)
         ).astype(np.float32)
+        if len(self._dead_cols):
+            vec_scaled[:, self._dead_cols] = 0.0
 
         # Raw score — more negative = more anomalous
         raw_score = float(self.model.score_samples(vec_scaled)[0])
@@ -102,6 +124,8 @@ class IsolationForestScorer:
         feature_matrix: shape (N, 35)
         """
         scaled = self.scaler.transform(feature_matrix).astype(np.float32)
+        if len(self._dead_cols):
+            scaled[:, self._dead_cols] = 0.0
         raw_scores = self.model.score_samples(scaled)
 
         results = []

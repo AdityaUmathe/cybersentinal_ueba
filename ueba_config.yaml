@@ -226,6 +226,12 @@ profile_store:
 
 # ── Dashboard API Server ──────────────────────────────────────────────────────
 dashboard:
+  # agent-sync disabled 2026-08-06: target soc@localhost:2222 was the
+  # 222->98 reverse tunnel, decommissioned in the SIEM 222->23 migration
+  # (spammed the log with SSH auth failures every poll). Re-enable only
+  # after repointing ssh_host at the current Wazuh manager with a key.
+  agent_sync:
+    enabled:        false
   host:             "0.0.0.0"
   port:             3026
   alerts_file:      "/root/NEW_DRIVE/aditya_ueba/ueba_alerts.jsonl"
@@ -247,10 +253,83 @@ dashboard:
     timeout_secs:   20
 
 
+# ── Authentication / SSO ──────────────────────────────────────────────────────
+# The dashboard shipped with no authentication at all: open CORS, bound to
+# 0.0.0.0:3026, every endpoint anonymous. This block is the first half of
+# closing that. Implemented in ueba_auth.py.
+#
+# ROLLOUT ORDER — do not skip step 3:
+#   1. enabled: true, enforce: false   ← where we are now. Endpoints exist and
+#      sessions can be minted, but nothing is gated. Zero risk to the SOC.
+#   2. Have the SIEM team mint a test assertion against the contract below and
+#      confirm GET /api/sso/ping reports ready=true, then complete one real
+#      round-trip through /auth/sso.
+#   3. Only then set enforce: true. Doing it earlier locks analysts out of a
+#      live dashboard — the server refuses to start in that state on purpose.
+auth:
+  enabled:            true
+  enforce:            false          # ← step 3 flips this, not before
+
+  # ── Token contract handed to the SIEM team ──
+  # We define these; their minter must match exactly or verification fails.
+  # Only HS256 is implemented. Setting RS256 raises at startup rather than
+  # silently degrading — that path is blocked on their cert PEM (needs
+  # IP:103.252.168.197 in the SAN), a confirmed JWKS URL and SIEM host.
+  algorithm:          "HS256"
+  issuer:             "cybersentinel-siem"    # verified against the `iss` claim
+  audience:           "ueba-dashboard"        # verified against the `aud` claim
+  secret_env:         "UEBA_SSO_SECRET"       # read from the environment, never from this file
+  leeway_secs:        60                      # clock-skew tolerance
+  max_token_age_secs: 300                     # reject a stale assertion even if its exp is generous
+
+  # Required claims: iss, aud, exp, iat, sub.
+  # Optional: jti (strongly recommended — it is what makes an assertion
+  # single-use), preferred_username, email, name, and the role claim below.
+
+  # ── Sessions ──
+  session_ttl_secs:   28800          # 8h absolute lifetime
+  session_idle_secs:  3600           # revoked after 1h idle
+  cookie_name:        "ueba_session"
+  cookie_secure:      false          # set true the moment this is behind TLS
+  cookie_samesite:    "Lax"
+  auth_db:            "/root/NEW_DRIVE/aditya_ueba/profiles/ueba_auth.db"
+
+  # ── Roles ──
+  # Ordered viewer < analyst < admin; a route gated on "analyst" admits admin.
+  # An unmapped SIEM group falls through to default_role rather than being
+  # refused, so adding a group upstream cannot lock its members out.
+  allow_jit:          true           # provision a valid-but-unseen subject on first login
+  default_role:       "viewer"
+  role_claim:         "roles"        # list[str], or a space/comma-joined string
+  role_map:
+    ueba-admin:       admin
+    soc-lead:         admin
+    soc-analyst:      analyst
+    soc-viewer:       viewer
+
+  # Never gated, even with enforce on. /api/health must stay open — the
+  # engine watchdog probes it every 2 minutes with no credential.
+  public_paths:
+    - "/api/health"
+    - "/api/sso/ping"
+    - "/auth/sso"
+    - "/api/auth/sso/exchange"
+
+  # Origin allowlist. Empty keeps the historical wide-open CORS. Populate it
+  # when enabling enforcement: wildcard origin plus a session cookie is what
+  # lets any page an analyst visits read the alert feed.
+  cors_origins: []
+
 # ── Streaming Engine ──────────────────────────────────────────────────────────
 streaming:
   poll_interval_ms: 100
   state_save_interval: 1000
+  # Isolation Forest batching (2026-08-27). sklearn score_samples() carries a
+  # large fixed per-call cost, so we score up to if_batch_size events per call
+  # instead of one. read_chunk_bytes must be big enough to yield a real batch:
+  # enriched lines average ~5.4 KB, so the old 64 KB chunk held only ~12 events.
+  if_batch_size: 128
+  read_chunk_bytes: 1048576
   max_partial_buffer_bytes: 1048576
   max_loaded_user_models: 100
 

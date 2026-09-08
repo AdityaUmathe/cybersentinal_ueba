@@ -20,6 +20,31 @@ import torch.nn as nn
 log = logging.getLogger("ueba.autoencoder")
 
 
+# ── Train/serve skew guard ────────────────────────────────────────────────────
+
+def _zero_variance_cols(scaler, tag: str) -> np.ndarray:
+    """Indices of features that were CONSTANT in the training set.
+
+    StandardScaler stores scale_=1.0 (var_=0) for a zero-variance column, so it
+    does not normalise it. If the live feed later starts populating that field
+    (e.g. an upstream enricher adds host_5m / rule.level AFTER the model was
+    trained), the raw value passes through unscaled and detonates the
+    autoencoder reconstruction error — pinning every event to highly_anomalous.
+    Such columns carry no learned signal anyway (the model trained on a
+    constant), so callers zero them post-scale to keep the model on the
+    distribution it was actually trained on. Remove once the model is retrained
+    on representative data (the scaler will then have real variance here).
+    """
+    var = getattr(scaler, "var_", None)
+    if var is None:
+        return np.array([], dtype=int)
+    cols = np.where(var == 0)[0]
+    if len(cols):
+        log.warning("%s skew-guard: masking %d zero-variance feature(s) the "
+                    "model never learned (indices %s)", tag, len(cols), list(cols))
+    return cols
+
+
 # ── Autoencoder Architecture (must match ueba_trainer.py) ─────────────────────
 
 class Autoencoder(nn.Module):
@@ -78,6 +103,7 @@ class AutoencoderScorer:
                  thresholds_path: str, config: dict):
         self.ae_dir     = Path(autoencoder_dir)
         self.scaler     = scaler
+        self._dead_cols = _zero_variance_cols(scaler, "AE")
         self.ae_config  = config["autoencoder"]
         self.arch_cfg   = self.ae_config["architecture"]
         self.max_cached = config["streaming"]["max_loaded_user_models"]
@@ -181,6 +207,9 @@ class AutoencoderScorer:
         vec_scaled = self.scaler.transform(
             feature_vec.reshape(1, -1)
         ).astype(np.float32)
+        # Neutralise features the model never learned (see _zero_variance_cols).
+        if len(self._dead_cols):
+            vec_scaled[:, self._dead_cols] = 0.0
         tensor = torch.from_numpy(vec_scaled).to(self.device)
 
         # Get best model for this user

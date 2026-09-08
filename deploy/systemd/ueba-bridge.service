@@ -1,0 +1,21 @@
+[Unit]
+Description=CyberSentinel UEBA Feed Bridge (222 -> 98 enriched sync over tunnel)
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/root/NEW_DRIVE/aditya_ueba
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/NEW_DRIVE/aditya_ueba
+ExecStart=/root/NEW_DRIVE/aditya_ueba/ueba_sync_bridge.sh
+# Tunnel (on 222) may not be up yet at boot; the script self-retries, and
+# Restart=always covers an outright exit.
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+StandardOutput=append:/root/NEW_DRIVE/aditya_ueba/logs/ueba_bridge.stdout.log
+StandardError=append:/root/NEW_DRIVE/aditya_ueba/logs/ueba_bridge.stdout.log
+
+[Install]
+WantedBy=multi-user.target

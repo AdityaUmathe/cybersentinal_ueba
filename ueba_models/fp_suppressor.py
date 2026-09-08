@@ -58,15 +58,23 @@ class FPPatternSuppressor:
 
     def __init__(self, patterns_file: str):
         self._path = Path(patterns_file)
+        # Per-pattern suppression tally, persisted alongside the patterns file so
+        # the dashboard can show a real "Matched" count. The engine drops a
+        # suppressed alert BEFORE it is written to ueba_alerts.jsonl, so the
+        # dashboard can never recover the count from the alert file — it lives
+        # only here.
+        self._stats_path = self._path.with_name("fp_suppress_stats.json")
+        self._counts: dict[str, int] = {}         # pattern id -> cumulative hits
         self._patterns: list[dict] = []           # parsed records
         self._index: dict[str, list[dict]] = {}   # normalized desc -> [pattern, ...]
         self._mtime: float = -1.0
         self._lock = threading.Lock()
         self._reload_errors = 0
         self.suppressed_count = 0
+        self._load_stats()
         self._maybe_reload()
-        log.info("FP suppressor initialized: file=%s, patterns=%d",
-                 self._path, len(self._patterns))
+        log.info("FP suppressor initialized: file=%s, patterns=%d, counts=%d",
+                 self._path, len(self._patterns), sum(self._counts.values()))
 
     def _maybe_reload(self) -> None:
         """Re-read patterns file if its mtime changed since the last load."""
@@ -157,6 +165,9 @@ class FPPatternSuppressor:
         for pat in candidates:
             if processed_at > pat["marked_at"]:
                 self.suppressed_count += 1
+                pid = pat.get("id") or ""
+                if pid:
+                    self._counts[pid] = self._counts.get(pid, 0) + 1
                 return pat
         return None
 
@@ -164,6 +175,35 @@ class FPPatternSuppressor:
         """Force an mtime check now (used by periodic stats logging so the
         reported pattern count is fresh even when no alerts have fired)."""
         self._maybe_reload()
+
+    def _load_stats(self) -> None:
+        """Load the persisted per-pattern hit tally so counts survive engine
+        restarts. Best-effort: a missing/corrupt file just starts from zero."""
+        try:
+            if self._stats_path.exists():
+                data = json.loads(self._stats_path.read_text(encoding="utf-8") or "{}")
+                if isinstance(data, dict):
+                    self._counts = {str(k): int(v) for k, v in data.items()
+                                    if isinstance(v, (int, float))}
+        except Exception as e:
+            log.warning("FP suppress-stats load failed (%s) — starting counts at 0", e)
+            self._counts = {}
+
+    def write_stats(self) -> None:
+        """Atomically persist per-pattern hit counts to the sibling stats file
+        (`fp_suppress_stats.json`) for the dashboard to read. Pruned to the
+        current pattern set so removed patterns don't leave stale rows."""
+        try:
+            with self._lock:
+                current = {p.get("id") for p in self._patterns if p.get("id")}
+                snapshot = {pid: c for pid, c in self._counts.items() if pid in current}
+                # Drop counts for patterns that no longer exist.
+                self._counts = dict(snapshot)
+            tmp = self._stats_path.with_suffix(self._stats_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(snapshot), encoding="utf-8")
+            tmp.replace(self._stats_path)
+        except Exception as e:
+            log.warning("FP suppress-stats write failed (%s)", e)
 
     @property
     def pattern_count(self) -> int:

@@ -485,6 +485,12 @@ class UEBAEngine:
         # Streaming config
         self.poll_ms    = config["streaming"]["poll_interval_ms"]
         self.save_every = config["streaming"]["state_save_interval"]
+        # Isolation Forest inference is the hot path and sklearn carries a large
+        # fixed cost per score_samples() call, so we score N events per call
+        # instead of one. The read chunk must be big enough to actually yield
+        # N events: enriched lines average ~5.4 KB, so 64 KB held only ~12.
+        self.if_batch_size    = config["streaming"].get("if_batch_size", 128)
+        self.read_chunk_bytes = config["streaming"].get("read_chunk_bytes", 1048576)
 
         # Output file
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -570,6 +576,15 @@ class UEBAEngine:
         # Layer 1: Isolation Forest
         if_result = self.if_scorer.score(feature_vec)
 
+        return self._process_scored(log_entry, feature_vec, metadata, if_result)
+
+    def _process_scored(self, log_entry: dict, feature_vec, metadata: dict,
+                        if_result: dict) -> dict | None:
+        """
+        Everything after Layer 1: autoencoder, fusion, and — for alerts only —
+        the enrichment tail. Split out of _process_log so a whole batch of
+        events can share ONE vectorised Isolation Forest call (_process_batch).
+        """
         # Layer 2: Autoencoder (user behavioral)
         user = metadata.get("user", "unknown")
         # Identity resolution — normalize aliases to canonical username
@@ -649,6 +664,57 @@ class UEBAEngine:
 
         return output_log
 
+    def _process_batch(self, log_entries: list) -> list:
+        """
+        Batch equivalent of _process_log.
+
+        Isolation Forest inference dominated the per-event budget: sklearn's
+        score_samples() has a large fixed per-call cost, so scoring one row at a
+        time spent ~96% of the budget inside that single call. Scoring N rows in
+        one call amortises the fixed cost across the batch.
+
+        Returns a list of (result_or_None, errored) aligned with log_entries so
+        the caller's stats accounting stays identical to the single-event path.
+        """
+        out = [(None, False)] * len(log_entries)
+
+        # Phase 1 — feature extraction. A failure here is not an error, it is an
+        # unusable event; _process_log has always returned None for those.
+        feats, metas, idx = [], [], []
+        for i, entry in enumerate(log_entries):
+            try:
+                fv = self.extractor.extract(entry)
+                md = self.extractor.extract_metadata(entry)
+            except Exception as e:
+                log.debug("Feature extraction failed: %s", e)
+                continue
+            feats.append(fv)
+            metas.append(md)
+            idx.append(i)
+
+        if not idx:
+            return out
+
+        # Phase 2 — ONE vectorised Isolation Forest call for the whole batch.
+        try:
+            if_results = self.if_scorer.score_batch(np.vstack(feats))
+        except Exception as e:
+            # A batch-level failure must never drop good events; fall back to
+            # the per-row path for this batch only.
+            log.warning("score_batch failed (%s) — falling back to per-row", e)
+            if_results = [self.if_scorer.score(f) for f in feats]
+
+        # Phase 3 — per-event tail (autoencoder, fusion, enrichment).
+        for k, i in enumerate(idx):
+            try:
+                out[i] = (self._process_scored(
+                    log_entries[i], feats[k], metas[k], if_results[k]), False)
+            except Exception as e:
+                log.debug("Processing error: %s", e)
+                out[i] = (None, True)
+
+        return out
+
     def run(self):
         """
         Main streaming loop. Tails enriched.jsonl and processes each line.
@@ -702,7 +768,7 @@ class UEBAEngine:
                 partial_line = ""
 
                 while self.running:
-                    chunk = in_file.read(65536)  # 64 KB at a time
+                    chunk = in_file.read(self.read_chunk_bytes)
 
                     if not chunk:
                         # No new data — sleep and poll
@@ -713,25 +779,26 @@ class UEBAEngine:
                     lines = (partial_line + chunk).split("\n")
                     partial_line = lines[-1]  # may be incomplete
 
+                    # Parse the whole chunk up front, then score it in batches
+                    # so the Isolation Forest runs vectorised (_process_batch).
+                    parsed = []
                     for line in lines[:-1]:
                         line = line.strip()
                         if not line:
                             continue
-
-                        # Parse JSON
                         try:
-                            log_entry = json.loads(line)
+                            parsed.append(json.loads(line))
                         except json.JSONDecodeError:
                             self.stats["total_errors"] += 1
-                            continue
 
-                        # Process through UEBA pipeline
-                        try:
-                            result = self._process_log(log_entry)
-                        except Exception as e:
-                            log.debug("Processing error: %s", e)
+                    results = []
+                    for _start in range(0, len(parsed), self.if_batch_size):
+                        results.extend(self._process_batch(
+                            parsed[_start:_start + self.if_batch_size]))
+
+                    for result, _errored in results:
+                        if _errored:
                             self.stats["total_errors"] += 1
-                            result = None
 
                         self.stats["total_processed"] += 1
                         events_since_save += 1

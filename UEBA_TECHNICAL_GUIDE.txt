@@ -1,0 +1,406 @@
+================================================================================
+                    CYBERSENTINEL UEBA - TECHNICAL GUIDE
+                   User & Entity Behaviour Analytics Engine
+================================================================================
+
+  Host       : box 98 (164.52.194.98)
+  Base path  : /root/NEW_DRIVE/aditya_ueba
+  Dashboard  : port 3026
+  Document   : 2026-08-28
+
+================================================================================
+1. WHAT IT IS
+================================================================================
+
+UEBA reads every enriched security event from the SIEM, scores how UNUSUAL
+that event is for the specific person or machine that produced it, and writes
+out only the small fraction that is genuinely anomalous.
+
+It is NOT a rules engine. A rule asks "did something forbidden happen?"
+UEBA asks "is this normal FOR THIS ENTITY?" A 3 a.m. login is unremarkable
+for the night-shift admin and alarming for the accounts clerk - same event,
+opposite verdict.
+
+Roughly 0.5% of events become alerts (0.48% measured across the current
+937k-event soak). Everything else is scored and discarded in memory.
+
+
+================================================================================
+2. ARCHITECTURE AT A GLANCE
+================================================================================
+
+     SIEM (Wazuh + Kafka correlation)
+            enriched eventsx
+                   |
+                   |  SSH reverse tunnel  [ueba-bridge]
+                   v
+          enriched.jsonl  (~5.7 KB/event)
+                   |
+                   v
+    +------------------------------------------+
+    |         ueba_engine.py - main loop        |
+    |                                           |
+    |   1. Identity resolution                  |<---> user_profiles.db
+    |   2. 35-feature vector                    |     30-day baselines
+    |                   |                       |
+    |         +---------+---------+             |
+    |         v                   v             |
+    |   LAYER 1              LAYER 2            |
+    |   Isolation Forest     Autoencoder        |
+    |   (batched, 128/call)  (PyTorch, CPU)     |
+    |         |                   |             |
+    |         +---------+---------+             |
+    |                   v                       |
+    |          Score fusion                     |
+    |          0.5 x IF + 0.5 x AE              |
+    +------------------|-----------------------+
+                       |
+          score < 0.75 | score >= 0.75
+        +--------------+--------------+
+        v                             v
+   DISCARDED                   ENRICHMENT TAIL
+   (never written)             - Campaign ID (HDBSCAN)
+                               - Similar past events (FAISS RAG)
+                               - Anomaly reasons
+                               - Evidence pack
+                                      |
+                                      v
+                          Noise + analyst-FP suppression
+                                      |
+                                      v
+                             ueba_alerts.jsonl
+                                      |
+                                      v
+                        Flask API + SSE -> Vite SPA
+                                port 3026
+
+
+================================================================================
+3. HOW AN EVENT BECOMES AN ALERT
+================================================================================
+
+--------------------------------------------------------------------------------
+STEP 1 - INGEST
+--------------------------------------------------------------------------------
+ueba-bridge.service pulls enriched events from the SIEM over an SSH tunnel and
+appends them to enriched.jsonl. The engine tails that file from a saved byte
+offset (.state/ueba.state), reading in 1 MB chunks and holding any trailing
+partial line until the next read. Restarts resume exactly where they stopped -
+no gap, no double-count.
+
+--------------------------------------------------------------------------------
+STEP 2 - IDENTITY RESOLUTION
+--------------------------------------------------------------------------------
+Every event must be attributed to an entity before it can be compared to a
+baseline. Resolution order:
+
+    real username  ->  ip:<source>  ->  host:<name>  ->  unknown
+
+An identity_resolution map in config merges aliases that are the same human -
+"RootSeeker", "sujalthakur2003@outl" and "RootSeeker\Sujal" all collapse to one
+identity, so their history isn't split across three thin, useless baselines.
+
+--------------------------------------------------------------------------------
+STEP 3 - FEATURE EXTRACTION
+--------------------------------------------------------------------------------
+ueba_preprocessor.py turns the JSON event into a 35-dimensional float vector:
+
+  GROUP                   COUNT  FEATURES
+  ----------------------  -----  --------------------------------------------
+  Temporal                    5  hour, day_of_week, is_weekend,
+                                 is_business_hours, is_night_shift
+  Event flags                 4  is_auth / is_network / is_file / is_process
+  Anomaly signals             9  brute_force, port_scan, tor, malicious_ip,
+                                 impossible_travel, lateral_movement,
+                                 data_exfiltration, after_hours,
+                                 high_frequency
+  Rate counters               4  src_ip 5m, src_ip 1h, user 1h, host 1h
+  Behavioural                 3  unique destinations 1h, unique ports 1h,
+                                 recent failures 5m
+  Geo                         3  distance_km, cross_border, cross_continent
+  Risk                        2  enrichment risk_score, rule.level
+  Network intel               1  is_cloud_provider
+  Categorical (encoded)       3  event_category, event_outcome,
+                                 traffic_direction
+  BEHAVIOURAL DEVIATION       1  how far this event sits from THAT ENTITY's
+                                 own 30-day baseline
+  ----------------------  -----  --------------------------------------------
+  TOTAL                      35
+
+Missing fields fill to 0.0. Feature 35 - the baseline deviation - is what makes
+this UEBA rather than generic anomaly detection.
+
+--------------------------------------------------------------------------------
+STEP 4 - SCORE IT TWICE
+--------------------------------------------------------------------------------
+Two independent models, deliberately chosen to fail differently.
+
+                    ISOLATION FOREST            AUTOENCODER
+  ---------------   -------------------------   -------------------------------
+  Catches           Globally rare events        Personally out-of-character
+                                                events
+  Method            200 random trees; points    35->24->12->24->35 net learns
+                    that isolate in few         to reconstruct YOUR normal;
+                    splits are rare             poor reconstruction = unlike
+                                                you
+  Trained on        Everyone, one global        Per-entity (453 models on
+                    model                       disk) with a global fallback
+  Params            contamination 0.005,        relu, dropout 0.1, threshold
+                    200 estimators              at 95th percentile
+  Runs on           CPU, VECTORISED IN          CPU (GPU left free for other
+                    BATCHES OF 128              tenants)
+
+Only the 100 most recently used user autoencoders stay resident in memory;
+the rest load on demand.
+
+--------------------------------------------------------------------------------
+STEP 5 - FUSE AND DECIDE
+--------------------------------------------------------------------------------
+
+    combined_score = 0.5 x isolation_forest + 0.5 x autoencoder
+
+  SCORE          VERDICT                        CONFIDENCE
+  -------------  -----------------------------  ----------
+  < 0.75         discarded - never written      -
+  0.75 - 0.85    suspicious                     low
+  0.85 - 0.93    anomalous                      medium
+  0.93 - 1.00    highly_anomalous               high
+
+KEY DESIGN FACT: below the 0.75 threshold the engine returns nothing at all.
+UEBA is a discrete ALERT PRODUCER, not a system that stores a score for every
+event. This is why it can run at feed rate on one core.
+
+--------------------------------------------------------------------------------
+STEP 6 - ENRICH (ALERTS ONLY)
+--------------------------------------------------------------------------------
+The expensive work runs only on the surviving ~0.5%:
+
+  * CAMPAIGN ID - HDBSCAN clusters related anomalies every 15 minutes
+    (min_cluster_size 5), so 50 alerts from one intrusion collapse into one
+    campaign an analyst can triage once.
+
+  * SIMILAR PAST EVENTS - a FAISS vector search over ~5.6M historical
+    anomalies returns the top 5 above 0.60 similarity. Answers "have we seen
+    this before, and what was it?"
+
+  * ANOMALY REASONS - plain-English causes attached to each alert:
+    impossible_travel, after_hours_activity, behavioral_baseline_deviation,
+    data_exfiltration, tor_exit_node, lateral_movement, brute_force_detected,
+    port_scan_detected, malicious_ip_reputation, cross_continent_access,
+    cross_border_access, high_frequency_events, statistical_anomaly.
+
+  * EVIDENCE PACK - the analyst's proof: signature, full raw_event, baseline
+    (their normal vs. this event), and history.
+
+--------------------------------------------------------------------------------
+STEP 7 - SUPPRESS NOISE
+--------------------------------------------------------------------------------
+Two filters run before anything is written:
+
+  1. STATIC NOISE SUPPRESSION - a configured list of boring signature IDs
+     (Fortigate traffic meta-rules, Sysmon channel hiccups, MikroTik VPN
+     logins), zero-risk network chatter, IPv6 multicast, the engine's own host
+     IP, and hostnames that must never be treated as users.
+
+  2. ANALYST FP SUPPRESSION - when an analyst marks an alert as a false
+     positive in the dashboard, the pattern is written to fp_patterns.json.
+     The engine watches that file's mtime and picks it up ON THE VERY NEXT
+     EVENT - no restart. Analysts tune their own signal-to-noise in real time.
+
+  Current soak: 64,379 events noise-suppressed, 443 FP-suppressed.
+
+--------------------------------------------------------------------------------
+STEP 8 - WRITE AND SERVE
+--------------------------------------------------------------------------------
+The alert is appended to ueba_alerts.jsonl - the original event preserved in
+full, plus a "ueba" block:
+
+    "ueba": {
+      "risk_verdict": "suspicious",
+      "confidence": "low",
+      "combined_score": 0.84,
+      "is_alert": true,
+      "anomaly_reasons": ["after_hours_activity",
+                          "high_frequency_events",
+                          "behavioral_baseline_deviation"],
+      "campaign_id": null,
+      "similar_past_events": [ ...5 nearest historical anomalies... ]
+    }
+
+
+================================================================================
+4. LEARNING AND MEMORY
+================================================================================
+
+  MECHANISM              CADENCE            WHAT IT DOES
+  ---------------------  -----------------  ----------------------------------
+  Profile store          live, flushed      Rolling 30-day baseline per
+  profiles/              every 60 s         entity: typical hours, countries,
+  user_profiles.db                          agents, average risk, events/hour,
+  (SQLite)                                  first/last seen
+
+  Weekly retrain         Sundays 03:30      Pulls the week's enriched .gz from
+  ueba_weekly_                              the SIEM, rebuilds both models on
+  retrain.sh                                GPU, validates, swaps in. Previous
+                                            models kept as timestamped
+                                            backups; a failed retrain restarts
+                                            the engine on the OLD models
+                                            rather than leaving it down
+
+  Daily rotation         00:05              Archives yesterday's alerts to a
+  ueba_rotate.sh                            zip, truncates the live file,
+                                            restarts the engine (~35 s gap)
+
+  FAISS index            grows at runtime   New anomalies added live up to a
+                                            7M-vector ceiling; the trainer
+                                            reseeds to 80% of it, leaving
+                                            headroom
+
+
+================================================================================
+5. DASHBOARD AND API
+================================================================================
+
+ueba_dashboard_server.py - Flask, single-origin, serves both the REST/SSE API
+and the compiled Vite SPA on port 3026.
+
+ANALYST-FACING PAGES:
+  Overview | Feed | Users | Campaigns | Endpoints | Incidents | Threat Map |
+  False Positives
+
+~25 ENDPOINTS. The ones that matter:
+
+  ENDPOINT                                 PURPOSE
+  ---------------------------------------  -----------------------------------
+  GET  /api/stream                         LIVE SSE - pushes each new alert
+                                           the instant it lands
+  GET  /api/feed                           Alert table, evidence stripped
+                                           (534 B/row vs 11.3 KB full)
+  GET  /api/evidence/<event_id>            Full evidence pack, lazy-loaded
+                                           per row
+  GET  /api/users                          Top-20 riskiest entities
+  GET  /api/campaigns , /api/incidents     Clustered attack views
+  GET  /api/agents , /api/agent/<name>     Endpoint coverage and health
+  POST /api/false-positive                 Analyst marks one alert - or an
+       (+ /campaign/<id>)                  entire campaign - as FP
+  POST /api/ai-analyze                     AI SECURITY ANALYST - proxies the
+                                           alert to Claude for a written
+                                           triage summary; falls back to a
+                                           local summary if no API key
+  GET  /api/geofeed                        Threat-map source geolocation
+  GET  /api/health                         Liveness + engine stats
+
+The feed is cached for 10 s to keep repeated polls off the alerts file.
+
+
+================================================================================
+6. OPERATIONS
+================================================================================
+
+SERVICES
+  ueba-engine | ueba-dashboard | ueba-bridge | ueba-engine-watchdog |
+  sshd-tunnel
+
+RESILIENCE BUILT IN
+  * Byte-offset state file -> crash-safe resume with no gap or duplication
+  * Watchdog unit restarts a hung engine
+  * Failed retrain rolls back to the previous models automatically
+  * Per-event exception isolation - one malformed event increments an error
+    counter, it does not stop the loop
+  * score_batch failure falls back to per-row scoring rather than dropping
+    the batch
+
+EVERY THRESHOLD LIVES IN ONE FILE
+  ueba_config.yaml holds paths, feature definitions, both models'
+  hyperparameters, fusion weights, verdict bands, RAG settings, suppression
+  lists, identity mappings, and streaming tuning. No thresholds are hard-coded
+  in the engine.
+
+
+================================================================================
+7. PERFORMANCE
+================================================================================
+
+Measured 2026-08-27 on box 98.
+
+  METRIC                              VALUE
+  ----------------------------------  ------------------------------------
+  Sustained throughput                208 events/sec
+                                      (70 before the batching fix)
+  Client feed rate                    89 events/sec - UEBA runs at 2.3x
+                                      headroom
+  End-to-end latency                  ~3 minutes
+  Alert rate                          ~0.5% of events
+  Peak alert volume                   1,034 alerts/min
+  Errors across 937k-event soak       0
+  Full alert / slim alert             11.3 KB / 534 B
+
+THE 2026-08-27 BATCHING FIX
+  The Isolation Forest was being scored one row at a time - 7.65 ms per event,
+  96% of the hot path, on a single core of a 60-core box. Two changes:
+  vectorise the scoring into batches of 128, and raise the read chunk from
+  64 KB to 1 MB (at 5.4 KB/event, 64 KB held only ~12 events, which would have
+  capped the win). Result: 2.97x throughput, verified bit-identical to the old
+  output across 3,000 real events and a 15,000-event end-to-end determinism
+  run.
+
+  The batch size self-tunes: a quiet feed produces small batches and low
+  latency; a backlog produces full batches and maximum drain rate.
+
+
+================================================================================
+8. KNOWN LIMITATIONS
+================================================================================
+
+  LIMITATION                IMPACT                          STATUS
+  ------------------------  ------------------------------  ------------------
+  The bridge is now the     ueba-bridge has rotation        OPEN - fix before
+  bottleneck                races, tunnel timeouts, and a   quoting any
+                            .gz backfill pointer that went  ingestion SLA
+                            stale for 3 days. 89 ev/s has
+                            never been observed arriving
+                            end-to-end
+
+  Dashboard has no          No login, no session, no user   SSO secret
+  authentication            table; CORS(app) open on        staged; SSO build
+                            0.0.0.0:3026                    pending
+
+  Single-core engine        Uses 1 of 60 cores. Entity      Not needed at
+                            sharding is the next lever      current volume
+
+  Cold-start entities       An entity needs ~2,000 events   BY DESIGN
+                            before it earns its own
+                            autoencoder; until then it
+                            scores against the global
+                            model
+
+  World-writable project    13 other users on this shared   OPEN - needs a
+  directory                 box can modify code that runs   decision
+                            as root
+
+
+================================================================================
+9. FILE MAP
+================================================================================
+
+  FILE                                ROLE
+  ----------------------------------  ------------------------------------------
+  ueba_engine.py                      Main streaming loop - tail, score,
+                                      enrich, suppress, write
+  ueba_preprocessor.py                Feature extraction, identity resolution,
+                                      profile store
+  ueba_models/isolation_forest.py     Layer 1 scorer (score, score_batch)
+  ueba_models/autoencoder.py          Layer 2 scorer, per-user model cache
+  ueba_models/clusterer.py            HDBSCAN campaigns + FAISS RAG retrieval
+  ueba_models/fp_suppressor.py        Analyst false-positive pattern matching
+  ueba_trainer.py / retrain.py        Model training and weekly rebuild
+  ueba_validate_models.py             Post-retrain validation gate
+  ueba_dashboard_server.py            Flask API + SSE + SPA host
+  ueba_config.yaml                    Every threshold and path
+  ueba_sync_bridge.sh                 SIEM -> box 98 event transport
+  ueba_rotate.sh                      Daily alert rotation
+  ueba_weekly_retrain.sh              Weekly model retrain
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================

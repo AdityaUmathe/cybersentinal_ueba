@@ -1,0 +1,11 @@
+[Unit]
+Description=CyberSentinel UEBA engine liveness watchdog (probes /api/health, restarts a stalled engine)
+# Only meaningful if the engine unit exists; don't fight a manual stop.
+After=ueba-engine.service ueba-dashboard.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ueba-engine-watchdog.sh
+# The script guards its own flap protection; keep systemd noise low.
+StandardOutput=null
+StandardError=journal

@@ -1,0 +1,13 @@
+[Unit]
+Description=SSH daemon for UEBA reverse tunnel (alt port 9022, isolated from ssh.socket)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /run/sshd
+ExecStartPre=/usr/sbin/sshd -t
+ExecStart=/usr/sbin/sshd -D -e -p 9022 -o PidFile=/run/sshd-tunnel.pid
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

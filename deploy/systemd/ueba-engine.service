@@ -1,0 +1,19 @@
+[Unit]
+Description=CyberSentinel UEBA Streaming Engine
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/root/NEW_DRIVE/aditya_ueba /data/aditya_ueba
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/NEW_DRIVE/aditya_ueba
+ExecStart=/root/NEW_DRIVE/aditya_ueba/venv/bin/python3 ueba_engine.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+StandardOutput=append:/root/NEW_DRIVE/aditya_ueba/logs/ueba_engine.stdout.log
+StandardError=append:/root/NEW_DRIVE/aditya_ueba/logs/ueba_engine.stdout.log
+
+[Install]
+WantedBy=multi-user.target

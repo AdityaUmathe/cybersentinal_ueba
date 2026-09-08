@@ -34,11 +34,42 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
+# orjson parses JSON ~2.5x faster than the stdlib (measured on real archives:
+# 6.4s -> 2.6s per day-file) and is already installed in the venv. It's the hot
+# path for both live-tail and archive ingestion, so use it when present and fall
+# back to stdlib json transparently otherwise. orjson returns bytes from dumps.
+try:
+    import orjson as _orjson
+
+    def _jloads(b):
+        return _orjson.loads(b)
+
+    def _jdumps(o) -> bytes:
+        return _orjson.dumps(o)
+except Exception:  # pragma: no cover - orjson should be present, but degrade gracefully
+    _orjson = None
+
+    def _jloads(b):
+        return json.loads(b)
+
+    def _jdumps(o) -> bytes:
+        return json.dumps(o).encode("utf-8")
+
 from flask import (
     Flask, jsonify, request, send_from_directory, Response,
     stream_with_context, has_request_context,
 )
 from flask_cors import CORS
+
+# SSO / session layer. Optional in the same way orjson and yaml are: if the
+# module (or PyJWT under it) is missing the dashboard still serves, just with
+# no authentication — which is exactly what it did before this existed.
+try:
+    import ueba_auth  # type: ignore
+    AUTH_MODULE_AVAILABLE = True
+except ImportError:
+    ueba_auth = None
+    AUTH_MODULE_AVAILABLE = False
 
 try:
     import yaml  # type: ignore
@@ -154,6 +185,21 @@ def load_dashboard_config(config_path: str | None) -> dict:
     return cfg
 
 
+def load_raw_config(config_path: str | None) -> dict:
+    """Whole parsed ueba_config.yaml — the auth layer reads its own `auth:` block."""
+    if not config_path or not yaml:
+        return {}
+    p = Path(config_path)
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"[dashboard] failed to read {config_path}: {e}")
+        return {}
+
+
 _SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 
@@ -167,7 +213,26 @@ DASHBOARD_DIST    = DASHBOARD_DIR / "dist"
 DASHBOARD_LEGACY  = DASHBOARD_DIR / "index.html"
 
 app = Flask(__name__, static_folder=None)
-CORS(app)
+
+
+def _configure_cors(auth_cfg: dict) -> str:
+    """Apply the CORS policy.
+
+    Historically this was a bare `CORS(app)` — `Access-Control-Allow-Origin: *`
+    for every route. That is preserved verbatim while the dashboard is
+    unauthenticated, so nothing changes for existing deployments. Once auth is
+    enabled AND an explicit origin allowlist is configured, we switch to that
+    allowlist with credentials enabled, because "wildcard origin" plus "session
+    cookie" is the combination that lets any page a logged-in analyst visits
+    read the alert feed.
+    """
+    origins = list(auth_cfg.get("cors_origins") or [])
+    if auth_cfg.get("enabled") and origins:
+        CORS(app, origins=origins, supports_credentials=True)
+        return f"restricted to {len(origins)} origin(s)"
+    CORS(app)
+    return "open (*) — no origin allowlist configured"
+
 
 # ── Response gzip ──
 # The feed/charts are rendered entirely client-side from raw /api/feed rows, so a
@@ -241,6 +306,56 @@ _archive_warn_at: float = 0.0    # rate-limit malformed-archive warnings (epoch 
 _last_window_total: int = 0      # pre-cap count of the most recent windowed read
 _MIN_DT = datetime.min.replace(tzinfo=timezone.utc)
 _ARCHIVE_RE = re.compile(r"ueba_alerts_(\d{4}-\d{2}-\d{2})\.jsonl\.zip$")
+
+# ── Slim projection ──────────────────────────────────────────────────────────
+# Every dashboard consumer (stats/users/campaigns/incidents/agents/feed and the
+# per-user/agent drilldowns) reads only a small, fixed set of fields. The full
+# engine alert is a fat nested record (~8-10KB) dominated by `evidence` and
+# `context.raw_event`, which exist only to (a) render the lazy evidence panel and
+# (b) derive the user + MITRE tags. Retaining the full record for the whole
+# history window is what pushed the dashboard to ~40GB RSS and made cold window
+# builds slow. We instead project each alert to a slim record AT INGEST — keeping
+# just the consumed fields and pre-resolving the user + MITRE lists — and drop
+# the heavy blobs. Measured: retained memory 3.9GB -> 0.11GB per archive day
+# (~3%). Evidence is no longer in RAM; /api/evidence lazy-loads it from disk by
+# event_id (rare, single-row action). Bump _SLIM_VER when the kept field set
+# changes so stale on-disk slim caches are rebuilt instead of served incomplete.
+_SLIM_VER = 1
+
+
+def _slim(a: dict) -> dict:
+    """Project a full engine alert to the compact record the dashboard actually
+    reads. Pre-resolves user + MITRE so subject/object/context.raw_event/evidence
+    can be dropped. `_resolve_user`/get_user and `_alert_ts` still work because
+    the resolved user is stored under the same `__user` memo key they check, and
+    the timestamp is recomputed lazily from the retained processed_at/event_time."""
+    ueba = a.get("ueba") or {}
+    sec  = a.get("security") or {}
+    host = a.get("host") or {}
+    rev  = (a.get("context") or {}).get("raw_event") or {}
+    ev   = a.get("evidence") or {}
+    return {
+        "event_id":   a.get("event_id"),
+        "event_time": a.get("event_time"),
+        "ueba": {
+            "risk_verdict":    ueba.get("risk_verdict"),
+            "combined_score":  ueba.get("combined_score"),
+            "campaign_id":     ueba.get("campaign_id"),
+            "anomaly_reasons": ueba.get("anomaly_reasons") or [],
+            "processed_at":    ueba.get("processed_at"),
+        },
+        "security": {
+            "signature":    sec.get("signature"),
+            "signature_id": sec.get("signature_id"),
+            "severity":     sec.get("severity"),
+        },
+        "host": {"name": host.get("name"), "ip": host.get("ip")},
+        # Pre-resolved (see get_user memo) so builders never touch the dropped
+        # subject/object/raw_event blobs again.
+        "__user": _resolve_user(a),
+        "__mitre_tactic":     ((rev.get("rule") or {}).get("mitre") or {}).get("tactic") or [],
+        "__mitre_techniques": ((ev.get("signature") or {}).get("mitre_techniques")) or [],
+    }
 
 # ── False-positive store — in-memory dict, persisted to FP_FILE atomically ──
 # Maps event_id -> {"event_id": ..., "reason": "...", "marked_at": "..."}
@@ -701,8 +816,8 @@ def _read_live_alerts(n: int | None = None) -> list:
                     if not raw.strip():
                         continue
                     try:
-                        _alert_cache.append(json.loads(raw))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        _alert_cache.append(_slim(_jloads(raw)))
+                    except Exception:
                         continue
                 cap = int(CFG.get("max_alerts", 500000) or 500000)
                 if len(_alert_cache) > cap:
@@ -722,7 +837,12 @@ def _alert_ts(a: dict) -> datetime | None:
     appended alerts ever pay the parse. A separate sentinel distinguishes
     "not computed yet" from a legitimately unparseable timestamp (cached as None)."""
     cached = a.get("__ts", _TS_UNSET)
-    if cached is not _TS_UNSET:
+    # Valid memo states: a datetime, or None (a cached "unparseable" result).
+    # Anything else (notably a str — which is what orjson would produce if a
+    # datetime memo ever got serialized into a persisted slim cache) is treated
+    # as "not computed" and recomputed, so a poisoned memo can never leak a str
+    # into the datetime comparisons in the builders.
+    if cached is None or isinstance(cached, datetime):
         return cached
     ueba = a.get("ueba") or {}
     ts = _parse_iso(ueba.get("processed_at") or a.get("event_time"))
@@ -731,9 +851,24 @@ def _alert_ts(a: dict) -> datetime | None:
 
 
 def _parse_archive_zip(path: Path) -> list | None:
-    """Unzip a daily archive and parse its JSONL into a list of alert dicts.
-    Returns None on a hard failure (corrupt zip / unreadable) so the caller can
-    skip it without aborting the whole window."""
+    """Unzip a daily archive and parse its JSONL into a list of SLIM alert dicts
+    (see _slim). Returns None on a hard failure (corrupt zip / unreadable) so the
+    caller can skip it without aborting the whole window.
+
+    Daily archives are immutable after the midnight rotation, so the first parse
+    also writes a compact on-disk slim cache (`<archive>.slimN`) next to the zip;
+    subsequent restarts load that directly — no unzip, no re-parse of the fat
+    records, no re-projection. Measured: cold archive warm 295s -> a few seconds
+    once the slim caches exist."""
+    slim_path = path.with_suffix(".slim%d" % _SLIM_VER)
+    # Fast path: a fresh slim cache already exists.
+    try:
+        if slim_path.exists() and slim_path.stat().st_mtime >= path.stat().st_mtime:
+            data = _jloads(slim_path.read_bytes())
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass  # fall through to a full parse/rebuild
     try:
         alerts: list = []
         with zipfile.ZipFile(path) as zf:
@@ -741,13 +876,19 @@ def _parse_archive_zip(path: Path) -> list | None:
             for name in names:
                 with zf.open(name) as fh:
                     for raw in fh:
-                        line = raw.decode("utf-8", "replace").strip()
-                        if not line:
+                        if not raw.strip():
                             continue
                         try:
-                            alerts.append(json.loads(line))
-                        except json.JSONDecodeError:
+                            alerts.append(_slim(_jloads(raw)))
+                        except Exception:
                             continue
+        # Persist the slim projection for the next restart (best-effort, atomic).
+        try:
+            tmp = slim_path.with_suffix(slim_path.suffix + ".tmp")
+            tmp.write_bytes(_jdumps(alerts))
+            tmp.replace(slim_path)
+        except Exception:
+            pass
         return alerts
     except Exception:
         return None
@@ -1245,8 +1386,12 @@ def _alert_to_feed_item(a: dict, include_evidence: bool = True) -> dict:
         "severity":     sec.get("severity"),
         "host":         host.get("name"),
         "host_ip":      host.get("ip"),
-        "mitre_tactic": (a.get("context", {}) or {}).get("raw_event", {}).get("rule", {}).get("mitre", {}).get("tactic", []),
-        "mitre_techniques": (ev.get("signature", {}) or {}).get("mitre_techniques", []),
+        # Slim records (from the cache) carry MITRE pre-extracted under __mitre_*;
+        # full records (the live SSE stream) fall back to the deep raw paths.
+        "mitre_tactic": a["__mitre_tactic"] if "__mitre_tactic" in a
+            else (a.get("context", {}) or {}).get("raw_event", {}).get("rule", {}).get("mitre", {}).get("tactic", []),
+        "mitre_techniques": a["__mitre_techniques"] if "__mitre_techniques" in a
+            else (ev.get("signature", {}) or {}).get("mitre_techniques", []),
         "fp":           _fp_dict.get(eid) if eid else None,
         "fp_pattern":   _matching_pattern(a),
     }
@@ -1276,24 +1421,68 @@ def _build_feed(alerts):
     return [_alert_to_feed_item(a, include_evidence=False) for a in reversed(recent)]
 
 
+def _find_evidence(event_id: str) -> dict:
+    """Lazy-load one alert's evidence blob from disk by event_id.
+
+    The in-memory caches hold SLIM records (no evidence) to keep RSS small, so a
+    panel expand re-reads the source. Live file first (recent, cheapest); then
+    archive zips newest-first. A cheap substring pre-filter (`id in raw_line`)
+    means only the matching line is ever JSON-parsed, so scanning even a large
+    file is fast; a full evidence fetch is a rare, single-row action."""
+    if not event_id:
+        return {}
+    target = event_id.encode("utf-8", "replace")
+
+    def _scan_lines(line_iter):
+        for raw in line_iter:
+            if target not in raw:
+                continue
+            try:
+                o = _jloads(raw)
+            except Exception:
+                continue
+            if o.get("event_id") == event_id:
+                return o.get("evidence") or {}
+        return None
+
+    # Live file (raw bytes, most likely target for recent alerts).
+    try:
+        if ALERTS_FILE.exists():
+            with open(ALERTS_FILE, "rb") as f:
+                hit = _scan_lines(f)
+                if hit is not None:
+                    return hit
+    except Exception:
+        pass
+
+    # Archives, newest day first.
+    adir = Path(CFG.get("archive_dir") or "")
+    if adir.is_dir():
+        try:
+            entries = sorted(adir.glob("ueba_alerts_*.jsonl.zip"), reverse=True)
+        except Exception:
+            entries = []
+        for path in entries:
+            try:
+                with zipfile.ZipFile(path) as zf:
+                    names = [n for n in zf.namelist() if n.endswith(".jsonl")] or zf.namelist()
+                    for name in names:
+                        with zf.open(name) as fh:
+                            hit = _scan_lines(fh)
+                            if hit is not None:
+                                return hit
+            except Exception:
+                continue
+    return {}
+
+
 @app.route("/api/evidence/<path:event_id>")
 def alert_evidence(event_id):
-    """Evidence blob for one alert, looked up by event_id across the live file
-    and the archives. Backs the dashboard's lazy evidence panel: /api/feed omits
-    evidence to stay light, and this returns it on demand when a row is expanded.
-    Returns {} if the alert isn't found or carries no evidence."""
-    if not event_id:
-        return jsonify({})
-    # Live file first — cheapest and the most likely target for recent alerts.
-    for a in reversed(_read_live_alerts()):
-        if a.get("event_id") == event_id:
-            return jsonify(a.get("evidence", {}) or {})
-    # Then the archives (mtime-cached), newest day first.
-    cutoff = datetime.now(timezone.utc) - timedelta(days=int(CFG.get("history_days", 95) or 95))
-    for a in reversed(_read_archived_alerts(cutoff)):
-        if a.get("event_id") == event_id:
-            return jsonify(a.get("evidence", {}) or {})
-    return jsonify({})
+    """Evidence blob for one alert, looked up by event_id from disk. Backs the
+    dashboard's lazy evidence panel: /api/feed omits evidence to stay light and
+    the caches hold slim records, so this returns it on demand when a row is
+    expanded. Returns {} if the alert isn't found or carries no evidence."""
+    return jsonify(_find_evidence(event_id) or {})
 
 
 @app.route("/api/users")
@@ -1829,9 +2018,33 @@ def unmark_campaign_false_positive(campaign_id):
 # ── False-positive PATTERN management ────────────────────────────────────────
 # Patterns auto-suppress any future alert whose rule description matches
 # (whitespace-trimmed, case-insensitive). One pattern = one rule description.
+def _read_suppress_stats() -> dict:
+    """Read the engine-written per-pattern hit tally ({pattern_id: count}) from
+    the sibling of the patterns file. Best-effort: missing/corrupt → {}."""
+    p = FP_PATTERNS_FILE.with_name("fp_suppress_stats.json")
+    try:
+        if p.exists():
+            d = json.loads(p.read_text(encoding="utf-8") or "{}")
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
 @app.route("/api/false-positive-patterns")
 def list_fp_patterns():
-    """Return all FP patterns with a `matched` count over the loaded alerts."""
+    """Return all FP patterns with a `matched` count.
+
+    The engine drops a suppressed alert BEFORE it is written to the alert
+    file, so counting matches in the loaded alerts would (correctly) yield ~0
+    once suppression is working. The real, cumulative count lives in the
+    engine-written sibling file `fp_suppress_stats.json` ({pattern_id: hits}).
+    We use that as the source of truth, and add any still-in-file matches
+    (alerts scored before the engine picked up the pattern) so the count is
+    never an under-count.
+    """
+    eng_counts = _read_suppress_stats()
     raw = load_alerts(include_fp=True)
     counts: dict = {}
     for a in raw:
@@ -1840,7 +2053,9 @@ def list_fp_patterns():
             counts[p.get("id")] = counts.get(p.get("id"), 0) + 1
     out = []
     for p in _fp_patterns:
-        out.append({**p, "matched": counts.get(p.get("id"), 0)})
+        pid = p.get("id")
+        matched = int(eng_counts.get(pid, 0)) + counts.get(pid, 0)
+        out.append({**p, "matched": matched})
     out.sort(key=lambda r: r.get("marked_at", ""), reverse=True)
     return jsonify(out)
 
@@ -2395,7 +2610,7 @@ def legacy_index():
 #      index.html so the client router can activate the right tab.
 #   3. Otherwise, 404.
 SPA_TAB_PATHS = {"overview", "feed", "users", "campaigns", "endpoints",
-                 "false-positives", "threatmap", "incidents"}
+                 "false-positives", "threatmap", "incidents", "auth"}
 
 @app.route("/<path:subpath>")
 def spa_fallback(subpath):
@@ -2499,6 +2714,22 @@ def main() -> None:
     if args.fp_file:          CFG["false_positives_file"] = args.fp_file
     if args.fp_patterns_file: CFG["fp_patterns_file"] = args.fp_patterns_file
 
+    # Auth must be initialised before the first request is served. A bad auth
+    # config raises here and stops the server on purpose: running "enforcing but
+    # unable to authenticate anyone" is an outage, and running "meant to be
+    # enforcing but silently open" is worse.
+    auth_status = "module not installed"
+    auth_cfg: dict = {}
+    if AUTH_MODULE_AVAILABLE:
+        raw_cfg = load_raw_config(args.config)
+        auth_cfg = ueba_auth.init_auth(app, raw_cfg)
+        ready, reason = ueba_auth.is_ready()
+        auth_status = (
+            f"enabled={auth_cfg.get('enabled')} enforce={auth_cfg.get('enforce')} "
+            f"ready={ready} ({reason})"
+        )
+    cors_status = _configure_cors(auth_cfg)
+
     ALERTS_FILE       = Path(CFG["alerts_file"])
     AGENTS_REGISTRY   = Path(CFG["agents_registry"])
     FP_FILE           = Path(CFG["false_positives_file"])
@@ -2516,6 +2747,8 @@ def main() -> None:
     print(f"  Dashboard build:  {'dist/ (Vite build)' if dist_ok else 'legacy index.html'}")
     print(f"  AI analyst:       "
           f"{'enabled' if CFG['ai_analyst'].get('enabled') and os.environ.get('ANTHROPIC_API_KEY') else 'fallback only'}")
+    print(f"  Auth/SSO:         {auth_status}")
+    print(f"  CORS:             {cors_status}")
     print(f"  Listening on:     http://{CFG['host']}:{CFG['port']}")
     print(f"  Archive dir:      {CFG.get('archive_dir')}  "
           f"(history {CFG.get('history_days')}d, feed cap {CFG.get('max_feed_alerts')})")

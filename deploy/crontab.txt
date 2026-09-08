@@ -1,0 +1,7 @@
+0 */2 * * * /usr/bin/truncate -s 0 /var/log/suricata/eve.json
+0 */2 * * * /usr/bin/truncate -s 0 /var/log/suricata/fast.log
+0 */2 * * * /usr/bin/truncate -s 0 /var/log/suricata/stats.log
+0 0 * * * /data/Vaani_Prod/ConversationalAI_VG/scripts/backup_postgres.sh >> /data/Vaani_Prod/backups/backup.log 2>&1
+5 0 * * * /root/NEW_DRIVE/aditya_ueba/ueba_rotate.sh
+30 3 * * 0 /root/NEW_DRIVE/aditya_ueba/ueba_weekly_retrain.sh
+*/5 * * * * /bin/bash /usr/xenv/check.sh >/dev/null 2>&1

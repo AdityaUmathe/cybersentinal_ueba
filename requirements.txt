@@ -15,6 +15,20 @@ flask-cors>=4.0,<5.0
 pyyaml>=6.0,<7.0
 requests>=2.31,<3.0
 
+# SSO / session layer (ueba_auth.py). The HS256 path needs only PyJWT itself;
+# cryptography is what PyJWT uses for the RS256/JWKS path, which is written
+# against but not yet enabled (blocked on the SIEM team's cert + JWKS URL).
+pyjwt>=2.8,<3.0
+cryptography>=42.0
+
+# Faster JSON on the alert-read hot path. ueba_preprocessor and the dashboard
+# both fall back to stdlib json when this is absent — silently, and ~2x slower.
+orjson>=3.9,<4.0
+
+# GeoIP lookup for the live threat map (/api/geofeed). Absent → the endpoint
+# degrades to empty with geo_ok=false rather than failing.
+geoip2>=4.7,<6.0
+
 # ── Engine + preprocessor + trainer ──────────────────────────────────────────
 numpy>=1.26,<3.0
 pandas>=2.1,<3.0
@@ -26,3 +40,10 @@ joblib>=1.3,<2.0
 # ── ML stack (CPU inference) — override with GPU wheels on the trainer host ──
 torch>=2.2,<3.0
 faiss-cpu>=1.7,<2.0
+
+# Campaign correlation (ueba_models/clusterer.py). This was imported but NOT
+# listed here until 2026-08-29, so a clean `pip install -r requirements.txt`
+# produced a dashboard that started fine and silently never grouped related
+# alerts into campaigns — the import is guarded by try/except ImportError and
+# only logs a warning. Keep it listed.
+hdbscan>=0.8.33,<0.9
